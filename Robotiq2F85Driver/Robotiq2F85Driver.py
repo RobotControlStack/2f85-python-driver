@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 import minimalmodbus as mm
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import struct
 import math
 import time
@@ -82,25 +82,25 @@ class LinuxFindTTYWithSerialNumber:
 @dataclass
 class GripperFault:
     #Reactivation must be performed before any further movement.
-    reactivation_required: bool
+    reactivation_required: bool = False
     #Activation bit must be set prior to action.
-    activation_required: bool
+    activation_required: bool = False
     #Gripper's temperature has risen above 85C and it needs to cool down.
-    overheating: bool
+    overheating: bool = False
     #There was no communication within the last second
-    communication_timeout: bool
+    communication_timeout: bool = False
     #The voltage supplied to the gripper is below 21.6 Volts
-    undervoltage: bool
+    undervoltage: bool = False
     #Automatic release in progress
-    is_auto_releasing: bool
+    is_auto_releasing: bool = False
     #Automatic release completed
-    auto_release_completed: bool
+    auto_release_completed: bool = False
     #Internal fault, contact manufacturer.
-    internal_fault: bool
+    internal_fault: bool = False
     #Activation fault
-    activation_fault: bool
+    activation_fault: bool = False
     #A current of more than 1 Amp. was supplied
-    overcurrent: bool
+    overcurrent: bool = False
 
 @dataclass
 class GripperStatus:
@@ -116,7 +116,7 @@ class GripperStatus:
     is_reset: bool
     is_activating: bool
     is_activated: bool
-    fault: GripperFault = GripperFault(0,0,0,0,0,0,0,0,0,0)
+    fault: GripperFault = field(default_factory=GripperFault)
 
 
 class Robotiq2F85Driver:
@@ -348,30 +348,30 @@ class Robotiq2F85Driver:
         fault_status_register, position_request_echo_register = struct.unpack("BB", values[1].to_bytes(2, "big"))
         position_register, current_register                   = struct.unpack("BB", values[2].to_bytes(2, "big"))
 
-        status = GripperStatus
+        gripper_fault = GripperFault(
+            reactivation_required = bool(fault_status_register == 0x05),
+            activation_required   = bool(fault_status_register == 0x07),
+            overheating           = bool(fault_status_register == 0x08),
+            undervoltage          = bool(fault_status_register == 0x0A),
+            is_auto_releasing     = bool(fault_status_register == 0x0B),
+            internal_fault        = bool(fault_status_register == 0x0C),
+            activation_fault      = bool(fault_status_register == 0x0D),
+            overcurrent           = bool(fault_status_register == 0x0E),
+            auto_release_completed= bool(fault_status_register == 0x0F),
+        )
 
-        gripper_fault = GripperFault
-        gripper_fault.reactivation_required = bool(fault_status_register == 0x05)
-        gripper_fault.activation_required   = bool(fault_status_register == 0x07)
-        gripper_fault.overheating           = bool(fault_status_register == 0x08)
-        gripper_fault.undervoltage          = bool(fault_status_register == 0x0A)
-        gripper_fault.is_auto_releasing     = bool(fault_status_register == 0x0B)
-        gripper_fault.internal_fault        = bool(fault_status_register == 0x0C)
-        gripper_fault.activation_fault      = bool(fault_status_register == 0x0D)
-        gripper_fault.overcurrent           = bool(fault_status_register == 0x0E)
-        gripper_fault.auto_release_completed= bool(fault_status_register == 0x0F)
-        status.fault = gripper_fault
-
-        status.activated        = bool(gripper_status_register & 2**0)
-        status.moving           = bool(gripper_status_register & 2**3) and (not bool(gripper_status_register & 2**6) and not bool(gripper_status_register & 2**7))
-        status.is_reset         = not bool(gripper_status_register & 2**4) and not bool(gripper_status_register & 2**5)
-        status.is_activating    = bool(gripper_status_register & 2**4) and not bool(gripper_status_register & 2**5)
-        status.is_activated     = bool(gripper_status_register & 2**4) and bool(gripper_status_register & 2**5)
-        status.obj_detected     = ( bool(gripper_status_register & 2**6) and not bool(gripper_status_register & 2**7) ) or ( not bool(gripper_status_register & 2**6) and bool(gripper_status_register & 2**7) )
-        
-        status.goal_opening = self.count_to_opening(position_request_echo_register)
-        status.current = self.count_to_current(current_register)
-        status.opening = self.count_to_opening(position_register)
+        status = GripperStatus(
+            activated    = bool(gripper_status_register & 2**0),
+            moving       = bool(gripper_status_register & 2**3) and (not bool(gripper_status_register & 2**6) and not bool(gripper_status_register & 2**7)),
+            current      = self.count_to_current(current_register),
+            obj_detected = ( bool(gripper_status_register & 2**6) and not bool(gripper_status_register & 2**7) ) or ( not bool(gripper_status_register & 2**6) and bool(gripper_status_register & 2**7) ),
+            opening      = self.count_to_opening(position_register),
+            goal_opening = self.count_to_opening(position_request_echo_register),
+            is_reset     = not bool(gripper_status_register & 2**4) and not bool(gripper_status_register & 2**5),
+            is_activating= bool(gripper_status_register & 2**4) and not bool(gripper_status_register & 2**5),
+            is_activated = bool(gripper_status_register & 2**4) and bool(gripper_status_register & 2**5),
+            fault        = gripper_fault,
+        )
 
         #Print the status of the gripper
         if self.debug:
