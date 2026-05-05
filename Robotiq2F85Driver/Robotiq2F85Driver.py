@@ -120,7 +120,7 @@ class GripperStatus:
 
 
 class Robotiq2F85Driver:
-    def __init__(self, serial_number:str, debug=False):
+    def __init__(self, serial_number:str, debug=False, ignore_read_frequency: bool = False):
         self.debug = debug
         self.device_serial_number = serial_number
         self.tty_device = LinuxFindTTYWithSerialNumber().find(serial_number)
@@ -133,6 +133,7 @@ class Robotiq2F85Driver:
         self.client.serial.parity   = mm.serial.PARITY_NONE
         self.client.serial.bytesize = 8
         self.client.serial.stopbits = mm.serial.STOPBITS_ONE
+        self.ignore_read_frequency = ignore_read_frequency
 
     @property
     def opening(self):
@@ -404,7 +405,8 @@ class Robotiq2F85Driver:
             print()
 
         #The maximum rate at which readings/commands can be sent is 200Hz
-        time.sleep(5/1000)
+        if not self.ignore_read_frequency:
+            time.sleep(5/1000)
 
         return status
     
