@@ -2,9 +2,9 @@ from pathlib import Path
 import subprocess
 import minimalmodbus as mm
 from dataclasses import dataclass, field
-import struct
 import math
 import time
+from typing import Callable
 
 class LinuxFindTTYWithSerialNumber:
     def __init__(self):
@@ -28,6 +28,13 @@ class LinuxFindTTYWithSerialNumber:
         str
             The path to the device with the given serial number or None if no device matching the specified serial number was found.
         '''
+
+        # Prefer stable udev symlinks when available. Their names often already include the serial.
+        by_id_dir = Path('/dev/serial/by-id')
+        if by_id_dir.exists():
+            for serial_link in by_id_dir.iterdir():
+                if serial_number in serial_link.name:
+                    return str(serial_link.resolve())
 
         # Get the list of all /dev/ttyUSB* devices.
         tty_devices = Path('/dev').glob('ttyUSB*')
@@ -120,10 +127,20 @@ class GripperStatus:
 
 
 class Robotiq2F85Driver:
-    def __init__(self, serial_number:str, debug=False, ignore_read_frequency: bool = False):
+    DEFAULT_STATUS_CACHE_HZ = 30.0
+    DEFAULT_POLL_INTERVAL_S = 0.01
+
+    def __init__(
+        self,
+        serial_number: str,
+        debug=False,
+        status_cache_hz: float = DEFAULT_STATUS_CACHE_HZ,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+        tty_device: str | None = None,
+    ):
         self.debug = debug
         self.device_serial_number = serial_number
-        self.tty_device = LinuxFindTTYWithSerialNumber().find(serial_number)
+        self.tty_device = tty_device if tty_device is not None else LinuxFindTTYWithSerialNumber().find(serial_number)
         
         if self.tty_device is None:
             raise Exception('No device with serial number {} found.'.format(serial_number))
@@ -133,7 +150,28 @@ class Robotiq2F85Driver:
         self.client.serial.parity   = mm.serial.PARITY_NONE
         self.client.serial.bytesize = 8
         self.client.serial.stopbits = mm.serial.STOPBITS_ONE
-        self.ignore_read_frequency = ignore_read_frequency
+        self.status_cache_period_s = 0.0 if status_cache_hz <= 0 else 1.0 / status_cache_hz
+        self.poll_interval_s = max(poll_interval_s, 0.0)
+        self._cached_status: GripperStatus | None = None
+        self._cached_status_timestamp = 0.0
+
+    def _invalidate_status_cache(self):
+        self._cached_status = None
+        self._cached_status_timestamp = 0.0
+
+    def _poll_until(
+        self,
+        predicate: Callable[[GripperStatus], bool],
+        timeout_s: float = 10.0,
+    ) -> GripperStatus:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            status = self.read_status(force_refresh=True)
+            if predicate(status):
+                return status
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out while waiting for gripper state change.")
+            time.sleep(self.poll_interval_s)
 
     @property
     def opening(self):
@@ -232,14 +270,10 @@ class Robotiq2F85Driver:
         action_request_register   = 1 << 8
         gripper_options1_register = 0
         self.client.write_registers(registeraddress=1000, values=[action_request_register + gripper_options1_register])
+        self._invalidate_status_cache()
 
         if blocking_call:
-            #Read the status while the gripper is activating
-            while self.is_activating:
-                pass
-            #Read the status until the gripper is activated
-            while not self.is_activated:
-                pass
+            self._poll_until(lambda status: status.is_activated)
 
     def deactivate(self, blocking_call:bool=True):
         '''
@@ -248,11 +282,10 @@ class Robotiq2F85Driver:
         action_request_register   = 0 << 8
         gripper_options1_register = 0
         self.client.write_registers(registeraddress=1000, values=[action_request_register + gripper_options1_register])
+        self._invalidate_status_cache()
 
         if blocking_call:
-            #Read the status until the gripper is deactivated
-            while self.is_activated:
-                pass
+            self._poll_until(lambda status: not status.is_activated)
 
     def reset(self, blocking_call:bool=True):
         '''
@@ -281,7 +314,7 @@ class Robotiq2F85Driver:
             tcp_z = 87.308 + 57.15*math.sqrt(1 - ((d - 12.7) / 57.15)**2)
         return tcp_z
     
-    def tcp_Z_offset(self, desired_opening:float, pad_thickness:float=7.8):
+    def tcp_Z_offset(self, desired_opening:float, pad_thickness:float=7.8, current_opening:float | None = None):
         '''
         Returns the distance along the gripper Z+ axis that the TCP (fixed at the middle of the fingertip)
         will move when the gripper goes from its current opening to the desired opening.
@@ -297,7 +330,8 @@ class Robotiq2F85Driver:
         pad_thickness : float
             Thickness of the pads. Default is 7.8mm (silicone pads).
         '''
-        current_opening = self.opening
+        if current_opening is None:
+            current_opening = self.read_status().opening
         current_tcp_z = self.tcp_Z_from_opening(current_opening, pad_thickness)
         desired_tcp_z = self.tcp_Z_from_opening(desired_opening, pad_thickness)
         tcp_z_offset = desired_tcp_z - current_tcp_z
@@ -336,18 +370,27 @@ class Robotiq2F85Driver:
         self.client.write_registers(registeraddress=1000, values=[action_request_register + gripper_options1_register, 
                                                                   gripper_options2_register + position_request_register, 
                                                                   speed_register + force_register])
+        self._invalidate_status_cache()
 
         if blocking_call:
-            #Read the status until the gripper is stopped
-            while self.is_moving:
-                pass
+            self._poll_until(lambda status: not status.moving)
 
-    def read_status(self) -> GripperStatus:
+    def read_status(self, force_refresh: bool = False) -> GripperStatus:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._cached_status is not None
+            and now - self._cached_status_timestamp < self.status_cache_period_s
+        ):
+            return self._cached_status
+
         values = self.client.read_registers(registeraddress=2000, number_of_registers=3, functioncode=4)
         #Each register is 16 bits and therefore contains two unsigned char each
-        gripper_status_register, reserved_register            = struct.unpack("BB", values[0].to_bytes(2, "big"))
-        fault_status_register, position_request_echo_register = struct.unpack("BB", values[1].to_bytes(2, "big"))
-        position_register, current_register                   = struct.unpack("BB", values[2].to_bytes(2, "big"))
+        gripper_status_register = values[0] >> 8
+        fault_status_register = values[1] >> 8
+        position_request_echo_register = values[1] & 0xFF
+        position_register = values[2] >> 8
+        current_register = values[2] & 0xFF
 
         gripper_fault = GripperFault(
             reactivation_required = bool(fault_status_register == 0x05),
@@ -404,10 +447,8 @@ class Robotiq2F85Driver:
                 print("Auto-release completed", end='')
             print()
 
-        #The maximum rate at which readings/commands can be sent is 200Hz
-        if not self.ignore_read_frequency:
-            time.sleep(5/1000)
-
+        self._cached_status = status
+        self._cached_status_timestamp = now
         return status
     
 
